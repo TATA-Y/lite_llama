@@ -6,6 +6,69 @@ from tqdm.auto import tqdm
 import math
 
 
+def pack_int4_weights(qweight: torch.Tensor, wbits: int = 4) -> torch.Tensor:
+    """
+    Pack quantized weights into int32 for efficient storage.
+    For 4-bit quantization, pack 8 weights into one int32.
+
+    Args:
+        qweight: Quantized weight tensor of shape (rows, cols) with values in [0, 15]
+        wbits: Number of bits per weight (4 for int4)
+
+    Returns:
+        Packed weight tensor of shape (rows, cols // 8)
+    """
+    assert wbits == 4, "This function currently only supports 4-bit packing"
+
+    rows, cols = qweight.shape
+    pack_factor = 32 // wbits  # 8 for 4-bit
+
+    # Ensure we can pack evenly
+    if cols % pack_factor != 0:
+        # Pad columns to make it divisible by pack_factor
+        pad_cols = pack_factor - (cols % pack_factor)
+        qweight = torch.nn.functional.pad(qweight, (0, pad_cols), value=0)
+        cols = qweight.shape[1]
+
+    packed_cols = cols // pack_factor
+    packed = torch.zeros((rows, packed_cols), dtype=torch.int32, device=qweight.device)
+
+    # Pack weights
+    for i in range(pack_factor):
+        packed |= (qweight[:, i::pack_factor].to(torch.int32) & 0xF) << (i * 4)
+
+    return packed
+
+
+def unpack_int4_weights(packed: torch.Tensor, original_cols: int, wbits: int = 4) -> torch.Tensor:
+    """
+    Unpack int4 weights from int32 storage.
+
+    Args:
+        packed: Packed weight tensor
+        original_cols: Original number of columns before packing
+        wbits: Number of bits per weight
+
+    Returns:
+        Unpacked weight tensor
+    """
+    assert wbits == 4, "This function currently only supports 4-bit unpacking"
+
+    rows, packed_cols = packed.shape
+    pack_factor = 32 // wbits  # 8 for 4-bit
+
+    # Calculate unpacked dimensions
+    unpacked_cols = packed_cols * pack_factor
+    unpacked = torch.zeros((rows, unpacked_cols), dtype=torch.int32, device=packed.device)
+
+    # Unpack weights
+    for i in range(pack_factor):
+        unpacked[:, i::pack_factor] = (packed >> (i * 4)) & 0xF
+
+    # Remove padding if necessary
+    return unpacked[:, :original_cols]
+
+
 class GPTQ:
     """
     Implementation of GPTQ (Generalized Post-Training Quantization) algorithm
@@ -52,14 +115,15 @@ class GPTQ:
 
         self.H += 2 / tmp * inp.matmul(inp.t())
 
-    def quantize(self, weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def quantize(self, weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Quantize the weight matrix using GPTQ algorithm
 
         Returns:
-            - qweight: quantized weights
+            - qweight: quantized weights (packed if 4-bit)
             - qzeros: zero points for each group
             - scales: scales for each group
+            - original_cols: original number of columns (for unpacking)
         """
         W = weight.clone()
         if not self.actorder:
@@ -67,6 +131,7 @@ class GPTQ:
             W = W.float()
 
         rows, columns = W.shape[0], W.shape[1]
+        original_cols = columns
 
         # Initialize Hessian
         if self.H is None:
@@ -143,7 +208,11 @@ class GPTQ:
 
             qweight[:, i1:i2] = Q1.to(torch.int32)
 
-        return qweight, qzeros, scales
+        # Pack weights if 4-bit
+        if self.wbits == 4:
+            qweight = pack_int4_weights(qweight, self.wbits)
+
+        return qweight, qzeros, scales, original_cols
 
 
 def quantize_gptq(
@@ -201,7 +270,7 @@ def quantize_gptq(
                 gptq.H = torch.eye(weight.shape[1], device=device)
 
             # Quantize the weight
-            qweight, qzeros, scales = gptq.quantize(weight)
+            qweight, qzeros, scales, original_cols = gptq.quantize(weight)
 
             # Store quantized parameters
             base_name = name.replace(".weight", "").replace("_weight", "")
@@ -210,6 +279,7 @@ def quantize_gptq(
             quantized_state_dict[f"{base_name}.scales"] = scales.cpu()
             quantized_state_dict[f"{base_name}.wbits"] = torch.tensor(wbits)
             quantized_state_dict[f"{base_name}.groupsize"] = torch.tensor(groupsize)
+            quantized_state_dict[f"{base_name}.original_cols"] = torch.tensor(original_cols)
 
         else:
             # Keep non-quantized parameters as is
@@ -218,19 +288,24 @@ def quantize_gptq(
     return quantized_state_dict
 
 
-def dequantize_weight(qweight, qzeros, scales, wbits=4):
+def dequantize_weight(qweight, qzeros, scales, wbits=4, original_cols=None):
     """
     Dequantize weight for inference
 
     Args:
-        qweight: Quantized weights
+        qweight: Quantized weights (packed if 4-bit)
         qzeros: Zero points
         scales: Scales
         wbits: Number of bits used for quantization
+        original_cols: Original number of columns (for unpacking)
 
     Returns:
         Dequantized weight tensor
     """
+    # Unpack if 4-bit
+    if wbits == 4 and original_cols is not None:
+        qweight = unpack_int4_weights(qweight, original_cols, wbits)
+
     # Get dimensions
     rows, columns = qweight.shape
     groupsize = columns // scales.shape[1]
@@ -252,33 +327,3 @@ def dequantize_weight(qweight, qzeros, scales, wbits=4):
         weight[:, start_idx:end_idx] = (group_qweight - group_zeros) * group_scales
 
     return weight
-
-
-def pack_quantized_weights(qweight, wbits=4):
-    """
-    Pack quantized weights for efficient storage
-
-    Args:
-        qweight: Quantized weight tensor (int32)
-        wbits: Number of bits per weight
-
-    Returns:
-        Packed weight tensor
-    """
-    rows, columns = qweight.shape
-
-    # Calculate packing parameters
-    pack_factor = 32 // wbits  # How many weights fit in one int32
-    packed_columns = (columns + pack_factor - 1) // pack_factor
-
-    # Create packed tensor
-    packed = torch.zeros((rows, packed_columns), dtype=torch.int32, device=qweight.device)
-
-    # Pack weights
-    for col in range(packed_columns):
-        for i in range(pack_factor):
-            src_col = col * pack_factor + i
-            if src_col < columns:
-                packed[:, col] |= (qweight[:, src_col] & ((1 << wbits) - 1)) << (i * wbits)
-
-    return packed
